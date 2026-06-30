@@ -83,10 +83,28 @@
 
   const ASPECTS = {
     '4:3': { ratio: 3 / 4, label: '4:3', desc: '4:3 — classic frame' },
+    '5:4': { ratio: 4 / 5, label: '5:4', desc: '5:4 — near-square frame' },
+    '3:2': { ratio: 2 / 3, label: '3:2', desc: '3:2 — classic 35mm frame' },
     '1:1': { ratio: 1, label: '1:1', desc: '1:1 — square frame' },
+    '16:9': { ratio: 9 / 16, label: '16:9', desc: '16:9 — widescreen frame' },
     full: { ratio: null, label: 'Full', desc: 'Full — fills the screen' },
   };
-  const ASPECT_ORDER = ['4:3', '1:1', 'full'];
+  const ASPECT_ORDER = ['4:3', '5:4', '3:2', '1:1', '16:9', 'full'];
+
+  // Photo quality controls the camera sensor resolution requested while in Photo mode.
+  const PHOTO_QUALITIES = {
+    '4k': { width: 3840, height: 2160, frameRate: 30 },
+    '1080p': { width: 1920, height: 1080, frameRate: 30 },
+    '720p': { width: 1280, height: 720, frameRate: 30 },
+  };
+  // Video resolution and frame rate are independent dials — every resolution can be
+  // paired with 24/30/60fps. Lower combinations record cooler & with smaller files.
+  const VIDEO_RESOLUTIONS = {
+    '720p': { width: 1280, height: 720 },
+    '1080p': { width: 1920, height: 1080 },
+    '4k': { width: 3840, height: 2160 },
+  };
+  const VIDEO_FPS_OPTIONS = [24, 30, 60];
 
   /* ---------------- Persisted preferences ---------------- */
   const PREF = {
@@ -94,6 +112,10 @@
     aspect: 'leader_aspect',
     autoSave: 'leader_autosave',
     cameraGranted: 'leader_camera_granted',
+    photoQuality: 'leader_photo_quality',
+    videoResolution: 'leader_video_resolution',
+    videoFps: 'leader_video_fps',
+    stamp: 'leader_stamp_enabled',
   };
 
   /* ---------------- State ---------------- */
@@ -102,14 +124,21 @@
     captureMode: 'photo', // 'photo' | 'video'
     lookIndex: 0,
     aspect: localStorage.getItem(PREF.aspect) || '4:3',
+    photoQuality: localStorage.getItem(PREF.photoQuality) || '4k',
+    videoResolution: localStorage.getItem(PREF.videoResolution) || '1080p',
+    videoFps: Number(localStorage.getItem(PREF.videoFps) || '30'),
     facing: 'environment',
     stream: null,
     track: null,
     flash: false,
     autoSave: localStorage.getItem(PREF.autoSave) !== 'false', // default true
+    stampEnabled: localStorage.getItem(PREF.stamp) !== 'false', // default true
     frame: Number(localStorage.getItem(PREF.frame) || '0'),
     noiseTiles: [],
     noiseIdx: 0,
+    noisePatternCache: new WeakMap(),
+    overlayCacheKey: '',
+    overlayCacheLayers: null,
     rafId: null,
     recording: false,
     recorder: null,
@@ -120,6 +149,14 @@
     viewerIndex: -1,
     micTrack: null,
     micRequested: localStorage.getItem('leader_mic_requested') === 'true',
+    shutterReady: false,    // guards against a stray click bleeding through the native permission sheet
+    renderPaused: false,    // true while gallery/viewer/settings cover the camera
+    lastFrameTime: 0,
+    zoom: 1,                // digital zoom multiplier applied on top of whichever lens is active
+    zoomMax: 4,
+    activeDeviceId: null,   // explicit lens override (ultra-wide / telephoto), null = default facingMode lens
+    cameraDevices: { back: {}, front: {} }, // discovered lens deviceIds, keyed by facing
+    devicesScanned: false,
   };
 
   /* ---------------- DOM ---------------- */
@@ -135,8 +172,6 @@
   const lookToggle = $('lookToggle');
   const ltChip = $('ltChip');
   const ltName = $('ltName');
-  const lastShot = $('lastShot');
-  const lastShotImg = $('lastShotImg');
   const thumbFrame = $('thumbFrame');
   const toastEl = $('toast');
   const viewfinder = $('viewfinder');
@@ -145,6 +180,9 @@
   const recTimer = $('recTimer');
   const recTime = $('recTime');
   const btnShutter = $('btnShutter');
+  const zoomBadge = $('zoomBadge');
+  const zoomCluster = $('zoomCluster');
+  const appEl = $('app');
 
   /* ---------------- Toast ---------------- */
   let toastTimer = null;
@@ -201,17 +239,28 @@
   }
 
   /* ---------------- Camera ---------------- */
+  function activeQuality() {
+    if (state.captureMode === 'video') {
+      const r = VIDEO_RESOLUTIONS[state.videoResolution];
+      return { width: r.width, height: r.height, frameRate: state.videoFps };
+    }
+    return PHOTO_QUALITIES[state.photoQuality];
+  }
+
   async function startCamera() {
     stopCamera();
+    state.shutterReady = false;
     try {
-      const constraints = {
-        audio: false, // no microphone request — keeps this to a single permission prompt
-        video: {
-          facingMode: state.facing,
-          width: { ideal: 1920 },
-          height: { ideal: 1920 },
-        },
+      const q = activeQuality();
+      const videoConstraints = {
+        width: { ideal: q.width },
+        height: { ideal: q.height },
+        frameRate: { ideal: q.frameRate, max: q.frameRate },
       };
+      if (state.activeDeviceId) videoConstraints.deviceId = { exact: state.activeDeviceId };
+      else videoConstraints.facingMode = state.facing;
+
+      const constraints = { audio: false, video: videoConstraints }; // no mic request here — single permission prompt
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       state.stream = stream;
       state.track = stream.getVideoTracks()[0];
@@ -221,9 +270,23 @@
       video.classList.toggle('mirror', state.facing === 'user');
       localStorage.setItem(PREF.cameraGranted, 'true');
       layoutViewfinder();
+      invalidateOverlayCache();
       runLoop();
+      syncZoomCapabilities();
+      if (!state.devicesScanned) { state.devicesScanned = true; refreshDeviceList(); }
+      // Ignore the shutter briefly: WebKit can deliver a stray synthetic click at the
+      // same screen coordinates right after the native camera-permission sheet is
+      // dismissed, which otherwise looks like the user tapped the shutter/record button.
+      setTimeout(() => { state.shutterReady = true; }, 700);
     } catch (err) {
       console.warn('Camera error', err);
+      // If an explicit lens (ultra-wide/tele) failed, fall back to the default lens
+      // for this facing direction instead of leaving the preview dead.
+      if (state.activeDeviceId) {
+        state.activeDeviceId = null;
+        state.zoom = 1;
+        return startCamera();
+      }
       permMsg.classList.remove('hidden');
       permMsg.querySelector('.pm-title').textContent =
         err.name === 'NotAllowedError' ? 'Camera access denied' : 'Camera unavailable';
@@ -235,10 +298,127 @@
   }
   function stopCamera() {
     if (state.rafId) cancelAnimationFrame(state.rafId);
+    state.rafId = null;
     if (state.stream) state.stream.getTracks().forEach((t) => t.stop());
     state.stream = null;
     state.track = null;
   }
+
+  // Release the camera while the tab/app is backgrounded, and while the gallery,
+  // viewer, or settings sheet are covering the live preview — this is the single
+  // biggest win for heat and battery, since a hidden camera+render loop still
+  // burns CPU/GPU otherwise.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      stopCamera();
+    } else if (!state.recording) {
+      startCamera();
+    }
+  });
+
+  /* ---------------- Zoom: lens discovery + digital crop ---------------- */
+  // Most phones expose a wide, an ultra-wide, and sometimes a telephoto lens as
+  // separate camera devices rather than as a single zoom range — Safari in
+  // particular has no reliable optical zoom API, so we detect those lenses by
+  // device label (only readable once permission is granted) and switch the whole
+  // stream to the matching device for 0.5x. Anything at 1x and above is handled
+  // as a fast, lossless-feeling digital crop on top of whichever lens is active.
+  async function refreshDeviceList() {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cams = devices.filter((d) => d.kind === 'videoinput');
+      const back = {}; const front = {};
+      cams.forEach((d) => {
+        const label = (d.label || '').toLowerCase();
+        const bucket = label.includes('front') ? front : back;
+        if (label.includes('ultra')) bucket.ultrawide = d.deviceId;
+        else if (label.includes('tele')) bucket.tele = d.deviceId;
+        else if (!bucket.wide) bucket.wide = d.deviceId;
+      });
+      state.cameraDevices = { back, front };
+      updateZoomCluster();
+    } catch (e) { /* enumerateDevices can fail quietly in some embedded webviews */ }
+  }
+  function lensesForFacing() {
+    return state.facing === 'user' ? state.cameraDevices.front : state.cameraDevices.back;
+  }
+  function syncZoomCapabilities() {
+    let max = 4;
+    if (state.track && state.track.getCapabilities) {
+      const caps = state.track.getCapabilities();
+      if (caps.zoom && caps.zoom.max) max = Math.max(2, Math.min(caps.zoom.max, 8));
+    }
+    state.zoomMax = max;
+    updateZoomCluster();
+  }
+  function updateZoomCluster() {
+    const lenses = lensesForFacing();
+    const has05 = !!lenses.ultrawide;
+    zoomCluster.querySelectorAll('.zoom-btn').forEach((b) => {
+      const v = Number(b.dataset.zoom);
+      if (v === 0.5) b.classList.toggle('hidden', !has05);
+      if (v > state.zoomMax) b.classList.toggle('hidden', true);
+      else if (v !== 0.5) b.classList.remove('hidden');
+    });
+  }
+  async function setZoomPreset(target) {
+    const lenses = lensesForFacing();
+    if (target === 0.5) {
+      if (!lenses.ultrawide) { toast('Ultra-wide isn\u2019t available on this device'); return; }
+      state.activeDeviceId = lenses.ultrawide;
+      state.zoom = 1;
+      await startCamera();
+    } else {
+      if (state.activeDeviceId && state.activeDeviceId !== lenses.wide) {
+        state.activeDeviceId = lenses.wide || null;
+        state.zoom = target;
+        await startCamera();
+      } else {
+        state.zoom = Math.min(target, state.zoomMax);
+      }
+    }
+    highlightZoomPreset(target);
+  }
+  function highlightZoomPreset(value) {
+    let closest = null, dist = Infinity;
+    zoomCluster.querySelectorAll('.zoom-btn:not(.hidden)').forEach((b) => {
+      const v = Number(b.dataset.zoom);
+      const d = Math.abs(v - value);
+      if (d < dist) { dist = d; closest = b; }
+    });
+    zoomCluster.querySelectorAll('.zoom-btn').forEach((b) => b.classList.toggle('active', b === closest));
+  }
+  zoomCluster.querySelectorAll('.zoom-btn').forEach((b) => {
+    b.addEventListener('click', () => setZoomPreset(Number(b.dataset.zoom)));
+  });
+
+  let pinchStartDist = null, pinchStartZoom = 1, zoomBadgeTimer = null;
+  function showZoomBadge() {
+    zoomBadge.textContent = `${state.zoom.toFixed(1)}×`;
+    zoomBadge.classList.remove('hidden');
+    clearTimeout(zoomBadgeTimer);
+    zoomBadgeTimer = setTimeout(() => zoomBadge.classList.add('hidden'), 900);
+  }
+  viewfinder.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 2) {
+      const [a, b] = e.touches;
+      pinchStartDist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      pinchStartZoom = state.zoom;
+    }
+  }, { passive: true });
+  viewfinder.addEventListener('touchmove', (e) => {
+    if (e.touches.length === 2 && pinchStartDist) {
+      const [a, b] = e.touches;
+      const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      const next = pinchStartZoom * (dist / pinchStartDist);
+      state.zoom = Math.min(state.zoomMax, Math.max(1, next));
+      showZoomBadge();
+      highlightZoomPreset(state.zoom);
+    }
+  }, { passive: true });
+  viewfinder.addEventListener('touchend', (e) => {
+    if (e.touches.length < 2) pinchStartDist = null;
+  }, { passive: true });
 
   /* ---------------- Viewfinder sizing (fills the screen, no overflow) ---------------- */
   function layoutViewfinder() {
@@ -263,6 +443,28 @@
   }
   window.addEventListener('resize', layoutViewfinder);
 
+  /* ---------------- Orientation ---------------- */
+  // Detect portrait / landscape-left / landscape-right / upside-down and expose it
+  // as data-rot on the app root. CSS uses that to keep plain icon glyphs (flip,
+  // settings, gallery, flash) upright, the way a native camera app would, without
+  // reflowing the rest of the layout — the control bar itself stays put.
+  function readOrientationAngle() {
+    if (screen.orientation && typeof screen.orientation.angle === 'number') return screen.orientation.angle;
+    if (typeof window.orientation === 'number') return ((window.orientation % 360) + 360) % 360;
+    return 0;
+  }
+  function updateOrientation() {
+    const angle = readOrientationAngle();
+    appEl.dataset.rot = String(angle);
+    layoutViewfinder();
+  }
+  if (screen.orientation && screen.orientation.addEventListener) {
+    screen.orientation.addEventListener('change', updateOrientation);
+  } else {
+    window.addEventListener('orientationchange', updateOrientation);
+  }
+  updateOrientation();
+
   /* ---------------- Noise tiles (pre-baked grain) ---------------- */
   function makeNoiseTile(size = 180) {
     const c = document.createElement('canvas');
@@ -282,13 +484,18 @@
   /* ---------------- Render pipeline ---------------- */
   function getLook() { return LOOKS[state.mode][state.lookIndex]; }
 
-  function drawCover(targetCtx, vidEl, w, h) {
+  function drawCover(targetCtx, vidEl, w, h, zoom = 1) {
     const vw = vidEl.videoWidth, vh = vidEl.videoHeight;
     if (!vw || !vh) return;
     const vRatio = vw / vh, cRatio = w / h;
     let sx, sy, sw, sh;
     if (vRatio > cRatio) { sh = vh; sw = vh * cRatio; sx = (vw - sw) / 2; sy = 0; }
     else { sw = vw; sh = vw / cRatio; sx = 0; sy = (vh - sh) / 2; }
+    if (zoom > 1) {
+      const nsw = sw / zoom, nsh = sh / zoom;
+      sx += (sw - nsw) / 2; sy += (sh - nsh) / 2;
+      sw = nsw; sh = nsh;
+    }
     targetCtx.drawImage(vidEl, sx, sy, sw, sh, 0, 0, w, h);
   }
 
@@ -318,21 +525,75 @@
     if (!tint) return;
     c.save(); c.globalCompositeOperation = 'screen'; c.fillStyle = tint; c.fillRect(0, 0, w, h); c.restore();
   }
-  function drawGrain(c, w, h, amount, animated) {
-    if (amount <= 0) return;
-    const tile = state.noiseTiles[state.noiseIdx];
-    if (animated) state.noiseIdx = (state.noiseIdx + 1) % state.noiseTiles.length;
-    const pattern = c.createPattern(tile, 'repeat');
-    c.save(); c.globalCompositeOperation = 'overlay'; c.globalAlpha = Math.min(amount, 0.6);
-    c.fillStyle = pattern; c.fillRect(0, 0, w, h); c.restore();
-  }
-  function drawScanlines(c, w, h) {
-    c.save(); c.globalCompositeOperation = 'multiply'; c.globalAlpha = 0.5; c.fillStyle = '#000';
+  function drawScanlinesShape(c, w, h) {
+    c.save(); c.fillStyle = '#000';
     for (let y = 0; y < h; y += 3) c.fillRect(0, y, w, 1);
     c.restore();
   }
+
+  // Vignette / light-leak / split-tone / scanline shapes are pure gradients & patterns
+  // that don't depend on the live video frame — building a fresh CanvasGradient and
+  // filling the whole canvas for each of them, every single animation frame, was the
+  // single biggest cost in the render loop. We bake each shape into an offscreen
+  // canvas once per look + canvas size, then every frame just blits that cached
+  // bitmap with the correct blend mode — the blend itself still reacts live to
+  // whatever the camera frame underneath is, only the *shape* is cached.
+  function buildOverlayLayers(look, w, h) {
+    const layers = {};
+    if (look.vignette > 0) {
+      const c = document.createElement('canvas'); c.width = w; c.height = h;
+      drawVignette(c.getContext('2d'), w, h, look.vignette);
+      layers.vignette = c;
+    }
+    if (look.leak) {
+      const c = document.createElement('canvas'); c.width = w; c.height = h;
+      drawLeak(c.getContext('2d'), w, h, look.leak);
+      layers.leak = c;
+    }
+    if (look.splitTone) {
+      const c = document.createElement('canvas'); c.width = w; c.height = h;
+      drawSplitTone(c.getContext('2d'), w, h, look.splitTone);
+      layers.splitTone = c;
+    }
+    if (look.scanlines) {
+      const c = document.createElement('canvas'); c.width = w; c.height = h;
+      drawScanlinesShape(c.getContext('2d'), w, h);
+      layers.scanlines = c;
+    }
+    return layers;
+  }
+  function getOverlayLayers(look, w, h) {
+    const key = `${look.id}:${w}x${h}`;
+    if (state.overlayCacheKey !== key) {
+      state.overlayCacheKey = key;
+      state.overlayCacheLayers = buildOverlayLayers(look, w, h);
+    }
+    return state.overlayCacheLayers;
+  }
+  function invalidateOverlayCache() { state.overlayCacheKey = ''; state.overlayCacheLayers = null; }
+
+  function getNoisePatterns(targetCtx) {
+    let patterns = state.noisePatternCache.get(targetCtx);
+    if (!patterns) {
+      patterns = state.noiseTiles.map((tile) => targetCtx.createPattern(tile, 'repeat'));
+      state.noisePatternCache.set(targetCtx, patterns);
+    }
+    return patterns;
+  }
+  function drawGrain(targetCtx, w, h, amount, animated) {
+    if (amount <= 0) return;
+    const patterns = getNoisePatterns(targetCtx);
+    const pattern = patterns[state.noiseIdx];
+    if (animated) state.noiseIdx = (state.noiseIdx + 1) % patterns.length;
+    targetCtx.save();
+    targetCtx.globalCompositeOperation = 'overlay';
+    targetCtx.globalAlpha = Math.min(amount, 0.6);
+    targetCtx.fillStyle = pattern;
+    targetCtx.fillRect(0, 0, w, h);
+    targetCtx.restore();
+  }
   function drawStamp(c, w, h, look) {
-    if (!look.stamp) return;
+    if (!look.stamp || !state.stampEnabled) return;
     const now = new Date();
     const txt = `${String(now.getMonth() + 1).padStart(2, '0')} ${String(now.getDate()).padStart(2, '0')} '${String(now.getFullYear()).slice(2)}`;
     const size = Math.max(14, w * 0.026);
@@ -346,26 +607,42 @@
   }
 
   function render(targetCtx, w, h, look, opts = {}) {
-    const { animatedGrain = true, mirror = false } = opts;
+    const { animatedGrain = true, mirror = false, useCache = true } = opts;
     targetCtx.save();
     if (mirror) { targetCtx.translate(w, 0); targetCtx.scale(-1, 1); }
     targetCtx.filter = look.css;
-    drawCover(targetCtx, video, w, h);
+    drawCover(targetCtx, video, w, h, state.zoom);
     targetCtx.restore();
     targetCtx.filter = 'none';
 
-    drawSplitTone(targetCtx, w, h, look.splitTone);
     drawTint(targetCtx, w, h, look.tint);
-    drawLeak(targetCtx, w, h, look.leak);
-    drawVignette(targetCtx, w, h, look.vignette);
-    if (look.scanlines) drawScanlines(targetCtx, w, h);
+
+    if (useCache) {
+      const layers = getOverlayLayers(look, w, h);
+      if (layers.splitTone) { targetCtx.save(); targetCtx.globalCompositeOperation = 'overlay'; targetCtx.drawImage(layers.splitTone, 0, 0); targetCtx.restore(); }
+      if (layers.leak) { targetCtx.save(); targetCtx.globalCompositeOperation = 'screen'; targetCtx.drawImage(layers.leak, 0, 0); targetCtx.restore(); }
+      if (layers.vignette) { targetCtx.save(); targetCtx.globalCompositeOperation = 'multiply'; targetCtx.drawImage(layers.vignette, 0, 0); targetCtx.restore(); }
+      if (layers.scanlines) { targetCtx.save(); targetCtx.globalCompositeOperation = 'multiply'; targetCtx.globalAlpha = 0.5; targetCtx.drawImage(layers.scanlines, 0, 0); targetCtx.restore(); }
+    } else {
+      // High-quality, uncached one-off pass used only for the still capture canvas.
+      drawSplitTone(targetCtx, w, h, look.splitTone);
+      drawLeak(targetCtx, w, h, look.leak);
+      drawVignette(targetCtx, w, h, look.vignette);
+      if (look.scanlines) { const s = document.createElement('canvas'); s.width = w; s.height = h; drawScanlinesShape(s.getContext('2d'), w, h); targetCtx.save(); targetCtx.globalCompositeOperation = 'multiply'; targetCtx.globalAlpha = 0.5; targetCtx.drawImage(s, 0, 0); targetCtx.restore(); }
+    }
     drawGrain(targetCtx, w, h, look.grain, animatedGrain);
   }
 
+  const TARGET_FPS = 30; // live preview cap — recording itself uses the quality setting's own fps
+  const FRAME_BUDGET = 1000 / TARGET_FPS;
+
   function runLoop() {
-    function frame() {
-      if (video.readyState >= 2 && canvas.width && canvas.height) {
-        render(ctx, canvas.width, canvas.height, getLook(), { animatedGrain: true, mirror: state.facing === 'user' });
+    function frame(now) {
+      if (!state.renderPaused && video.readyState >= 2 && canvas.width && canvas.height) {
+        if (now - state.lastFrameTime >= FRAME_BUDGET) {
+          state.lastFrameTime = now;
+          render(ctx, canvas.width, canvas.height, getLook(), { animatedGrain: true, mirror: state.facing === 'user' });
+        }
       }
       state.rafId = requestAnimationFrame(frame);
     }
@@ -389,6 +666,52 @@
   });
   document.querySelectorAll('#aspectSettingSwitch .seg-btn').forEach((b) => {
     b.addEventListener('click', () => setAspect(b.dataset.aspect));
+  });
+
+  /* ---------------- Quality control ---------------- */
+  const PHOTO_Q_LABEL = { '4k': '4K', '1080p': '1080p', '720p': '720p' };
+
+  function setPhotoQuality(key, restart = true) {
+    state.photoQuality = key;
+    localStorage.setItem(PREF.photoQuality, key);
+    document.querySelectorAll('#photoQualitySwitch .seg-btn').forEach((b) =>
+      b.classList.toggle('active', b.dataset.photoQuality === key));
+    if (restart && state.captureMode === 'photo' && !state.recording) startCamera();
+  }
+  function setVideoResolution(key, restart = true) {
+    state.videoResolution = key;
+    localStorage.setItem(PREF.videoResolution, key);
+    document.querySelectorAll('#videoResSwitch .seg-btn').forEach((b) =>
+      b.classList.toggle('active', b.dataset.videoRes === key));
+    if (restart && state.captureMode === 'video' && !state.recording) startCamera();
+  }
+  function setVideoFps(fps, restart = true) {
+    state.videoFps = fps;
+    localStorage.setItem(PREF.videoFps, String(fps));
+    document.querySelectorAll('#videoFpsSwitch .seg-btn').forEach((b) =>
+      b.classList.toggle('active', Number(b.dataset.videoFps) === fps));
+    if (restart && state.captureMode === 'video' && !state.recording) startCamera();
+  }
+  document.querySelectorAll('#photoQualitySwitch .seg-btn').forEach((b) => {
+    b.addEventListener('click', () => {
+      if (state.recording) { toast('Stop recording first'); return; }
+      setPhotoQuality(b.dataset.photoQuality);
+      toast(`Photo quality: ${PHOTO_Q_LABEL[b.dataset.photoQuality]}`);
+    });
+  });
+  document.querySelectorAll('#videoResSwitch .seg-btn').forEach((b) => {
+    b.addEventListener('click', () => {
+      if (state.recording) { toast('Stop recording first'); return; }
+      setVideoResolution(b.dataset.videoRes);
+      toast(`Video resolution: ${b.dataset.videoRes}`);
+    });
+  });
+  document.querySelectorAll('#videoFpsSwitch .seg-btn').forEach((b) => {
+    b.addEventListener('click', () => {
+      if (state.recording) { toast('Stop recording first'); return; }
+      setVideoFps(Number(b.dataset.videoFps));
+      toast(`Video frame rate: ${b.dataset.videoFps}fps`);
+    });
   });
 
   /* ---------------- Dial / mode UI ---------------- */
@@ -470,6 +793,7 @@
   document.querySelectorAll('#captureModeSwitch .seg-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       if (state.recording) { toast('Stop recording first'); return; }
+      if (btn.dataset.capture === state.captureMode) return;
       document.querySelectorAll('#captureModeSwitch .seg-btn').forEach((b) => {
         b.classList.toggle('active', b === btn);
         b.setAttribute('aria-selected', b === btn ? 'true' : 'false');
@@ -477,6 +801,7 @@
       state.captureMode = btn.dataset.capture;
       btnShutter.setAttribute('aria-label', state.captureMode === 'video' ? 'Record video' : 'Take photo');
       if (state.captureMode === 'video') ensureMic();
+      startCamera(); // re-request the stream at this mode's quality preset
     });
   });
 
@@ -484,6 +809,9 @@
   $('btnFlip').addEventListener('click', () => {
     if (state.recording) { toast('Stop recording first'); return; }
     state.facing = state.facing === 'user' ? 'environment' : 'user';
+    state.activeDeviceId = null;
+    state.zoom = 1;
+    highlightZoomPreset(1);
     startCamera();
   });
 
@@ -507,10 +835,12 @@
   function openSettings() {
     settingsSheet.classList.remove('hidden');
     settingsBackdrop.classList.remove('hidden');
+    state.renderPaused = true;
   }
   function closeSettings() {
     settingsSheet.classList.add('hidden');
     settingsBackdrop.classList.add('hidden');
+    state.renderPaused = false;
   }
   $('btnSettings').addEventListener('click', openSettings);
   $('btnCloseSettings').addEventListener('click', closeSettings);
@@ -522,6 +852,14 @@
     state.autoSave = toggleAutoSave.checked;
     localStorage.setItem(PREF.autoSave, String(state.autoSave));
     toast(state.autoSave ? 'Auto-save to Photos turned on' : 'Auto-save to Photos turned off');
+  });
+
+  const toggleStamp = $('toggleStamp');
+  toggleStamp.checked = state.stampEnabled;
+  toggleStamp.addEventListener('change', () => {
+    state.stampEnabled = toggleStamp.checked;
+    localStorage.setItem(PREF.stamp, String(state.stampEnabled));
+    toast(state.stampEnabled ? 'Date stamp enabled' : 'Date stamp disabled');
   });
 
   /* ---------------- Capture: photo ---------------- */
@@ -569,15 +907,13 @@
     };
     await dbAdd(record);
 
-    lastShotImg.src = dataUrl;
-    lastShot.classList.add('show');
     thumbFrame.innerHTML = `<img src="${dataUrl}" alt="Last photo" />`;
 
     setTimeout(() => btnShutter.classList.remove('flashing'), 220);
     toast(`Captured — ${look.name}`);
     refreshGalleryIfOpen();
 
-    if (state.autoSave) savePhotoBlob(blob, `leader-${record.id}.jpg`, 'image/jpeg');
+    if (state.autoSave) offerSaveToPhotos(blob, `leader-${record.id}.jpg`, 'image/jpeg', record.id);
   }
 
   /* ---------------- Capture: video ---------------- */
@@ -607,7 +943,7 @@
   async function startRecording() {
     if (!canvas.captureStream) { toast('Video recording isn\u2019t supported in this browser'); return; }
     const mime = pickRecorderMime();
-    const fps = 30;
+    const fps = state.videoFps;
     const camStream = canvas.captureStream(fps);
     const tracks = [...camStream.getVideoTracks()];
     if (state.micTrack && state.micTrack.readyState === 'live') tracks.push(state.micTrack);
@@ -650,10 +986,11 @@
     refreshGalleryIfOpen();
 
     const ext = type.includes('mp4') ? 'mp4' : 'webm';
-    if (state.autoSave) savePhotoBlob(blob, `leader-${record.id}.${ext}`, type);
+    if (state.autoSave) offerSaveToPhotos(blob, `leader-${record.id}.${ext}`, type, record.id);
   }
 
   function handleShutter() {
+    if (!state.shutterReady) return; // camera just started — ignore any stray click from the permission sheet
     if (state.captureMode === 'video') {
       if (state.recording) stopRecording(); else startRecording();
     } else {
@@ -661,26 +998,32 @@
     }
   }
   btnShutter.addEventListener('click', handleShutter);
-  lastShot.addEventListener('click', () => openGallery());
 
-  /* ---------------- Saving to Photos ---------------- */
-  async function savePhotoBlob(blob, filename, mime) {
+  /* ---------------- Saving to your camera roll ---------------- */
+  // iOS/Safari has no API that writes straight into Photos — the only two routes
+  // a website has are (1) the native Share Sheet's "Save Image"/"Save Video" action,
+  // or (2) a long-press on an on-screen <img>/<video> element, both of which save to
+  // Photos directly. We never fall back to an <a download> link, since that saves to
+  // the Files app instead of the camera roll.
+  async function offerSaveToPhotos(blob, filename, mime, recordId) {
     try {
       const file = new File([blob], filename, { type: mime });
       if (navigator.canShare && navigator.canShare({ files: [file] })) {
         await navigator.share({ files: [file] });
-        toast('Choose "Save" to add it to your camera roll');
+        toast('Choose "Save Image" / "Save Video" to add it to your camera roll');
         return;
       }
     } catch (err) {
-      if (err && err.name === 'AbortError') return; // user cancelled the share sheet
+      if (err && err.name === 'AbortError') return; // user dismissed the share sheet — respect it
     }
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = filename;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
-    toast('Saved — check Downloads, or long-press to add to Photos');
+    // Share isn't available here — open the photo/video full-screen so a long-press
+    // can save it straight to Photos.
+    await refreshGallery();
+    const idx = state.rollCache.findIndex((r) => r.id === recordId);
+    if (idx > -1) {
+      openViewer(idx);
+      toast('Long-press the image to save it to Photos');
+    }
   }
 
   /* ---------------- Gallery ---------------- */
@@ -693,9 +1036,14 @@
   async function openGallery() {
     galleryOpen = true;
     gallery.classList.remove('hidden');
+    state.renderPaused = true;
     await refreshGallery();
   }
-  function closeGallery() { galleryOpen = false; gallery.classList.add('hidden'); }
+  function closeGallery() {
+    galleryOpen = false;
+    gallery.classList.add('hidden');
+    if (viewer.classList.contains('hidden')) state.renderPaused = false;
+  }
   function refreshGalleryIfOpen() { if (galleryOpen) refreshGallery(); }
 
   async function refreshGallery() {
@@ -731,6 +1079,7 @@
 
   function openViewer(index) {
     state.viewerIndex = index;
+    state.renderPaused = true;
     renderViewer();
     viewer.classList.remove('hidden');
   }
@@ -738,6 +1087,7 @@
     viewer.classList.add('hidden');
     viewerVideo.pause();
     state.viewerIndex = -1;
+    if (!galleryOpen) state.renderPaused = false;
   }
   function renderViewer() {
     const item = currentViewerItem();
@@ -797,7 +1147,7 @@
     if (!item) return;
     const ext = item.type === 'video' ? (item.mime && item.mime.includes('mp4') ? 'mp4' : 'webm') : 'jpg';
     const mime = item.type === 'video' ? (item.mime || 'video/webm') : 'image/jpeg';
-    savePhotoBlob(item.blob, `leader-${item.id}.${ext}`, mime);
+    offerSaveToPhotos(item.blob, `leader-${item.id}.${ext}`, mime, item.id);
   });
   $('btnDelete').addEventListener('click', async () => {
     const item = currentViewerItem();
@@ -813,6 +1163,8 @@
   /* ---------------- Init ---------------- */
   fcNum.textContent = String(state.frame).padStart(3, '0');
   setAspect(state.aspect);
+  setPhotoQuality(state.photoQuality, false);
+  setVideoQuality(state.videoQuality, false);
   buildDial();
   startCamera();
 

@@ -53,6 +53,7 @@ img{display:block; max-width:100%;}
 }
 .iconbtn svg{ width:17px; height:17px; }
 .iconbtn:active{ background:var(--olive); }
+.readout-spacer{ width:36px; height:36px; flex:0 0 auto; }
 
 .readout-center{ display:flex; align-items:center; gap:8px; }
 .frame-counter{
@@ -78,7 +79,7 @@ img{display:block; max-width:100%;}
 /* ---------- Viewfinder ---------- */
 .viewfinder-wrap{
   flex:1 1 auto; min-height:0; display:flex; align-items:center; justify-content:center;
-  padding:6px 10px; overflow:hidden;
+  padding:4px 8px; overflow:hidden;
 }
 .viewfinder{
   position:relative; overflow:hidden; background:#000; border-radius:16px;
@@ -111,32 +112,46 @@ img{display:block; max-width:100%;}
 .pm-title{ font-weight:600; font-size:16px; }
 .pm-body{ color:var(--bone-dim); font-size:13px; max-width:260px; }
 
-.last-shot{
-  position:absolute; top:12px; right:12px; width:42px; height:56px; border-radius:6px;
-  overflow:hidden; border:2px solid var(--bone); box-shadow:0 4px 14px rgba(0,0,0,.45);
-  opacity:0; transform:translateY(-6px) scale(.9); transition:opacity .25s, transform .25s;
+/* ---------- Flip row (zoom presets + flip, sits between preview and controls) ---------- */
+.flip-row{
+  flex:0 0 auto; display:flex; align-items:center; justify-content:center; gap:14px; padding:6px 0 2px;
 }
-.last-shot.show{ opacity:1; transform:translateY(0) scale(1); }
-.last-shot img{ width:100%; height:100%; object-fit:cover; }
+.zoom-cluster{
+  display:flex; gap:4px; background:var(--charcoal-2); border:1px solid var(--line); border-radius:999px; padding:3px;
+}
+.zoom-btn{
+  border:none; background:transparent; color:var(--bone-dim); font-family:var(--mono); font-size:11px;
+  font-weight:600; width:30px; height:26px; border-radius:999px; transition:background .15s, color .15s;
+}
+.zoom-btn.active{ background:var(--bone); color:var(--charcoal); }
+.zoom-badge{
+  position:absolute; left:50%; bottom:16px; transform:translateX(-50%);
+  background:rgba(0,0,0,.55); color:var(--bone); font-family:var(--mono); font-size:13px; font-weight:600;
+  padding:6px 12px; border-radius:999px; opacity:0; transition:opacity .15s; pointer-events:none;
+}
+.zoom-badge:not(.hidden){ opacity:1; }
 
 /* ---------- Compact control stack ---------- */
 .controls{
-  flex:0 0 auto; padding:8px 14px 0; display:flex; flex-direction:column; gap:6px;
+  flex:0 0 auto; padding:0 14px 0; display:flex; flex-direction:column; gap:5px;
 }
+.controls-row{ display:flex; gap:6px; }
+.controls-row .segmented{ flex:1; }
 .segmented{
   display:flex; background:var(--charcoal-2); border:1px solid var(--line); border-radius:10px; padding:3px;
 }
 .segmented .seg-btn{
-  flex:1; border:none; background:transparent; color:var(--bone-dim); font-size:12.5px; font-weight:600;
-  padding:7px 0; border-radius:8px; transition:background .15s, color .15s;
+  flex:1; border:none; background:transparent; color:var(--bone-dim); font-size:12px; font-weight:600;
+  padding:6px 0; border-radius:8px; transition:background .15s, color .15s;
 }
 .segmented .seg-btn.active{ background:var(--bone); color:var(--charcoal); }
 .segmented.small{ padding:2px; }
-.segmented.small .seg-btn{ font-size:11px; padding:5px 0; }
+.segmented.small .seg-btn{ font-size:10.5px; padding:5px 0; }
+.segmented.full-width{ width:100%; margin-top:4px; }
 
 .look-toggle{
   display:flex; align-items:center; gap:8px; background:transparent; border:1px solid var(--line);
-  border-radius:10px; padding:7px 10px; color:var(--bone); align-self:stretch;
+  border-radius:10px; padding:6px 10px; color:var(--bone); align-self:stretch;
 }
 .lt-chip{
   width:24px; height:24px; border-radius:50%; background:var(--charcoal-2); border:1px solid var(--amber);
@@ -339,3 +354,11 @@ img{display:block; max-width:100%;}
   .controls{ gap:4px; }
   .deck{ padding-top:6px; }
 }
+
+/* ---------- Orientation: rotate plain icon glyphs so they stay upright when the
+   phone is rotated, the way native camera apps do, without reflowing the whole
+   layout (the portrait-shaped control bar stays put — only icons turn). ---------- */
+.rot-icon{ transition: transform .25s ease; }
+#app[data-rot="90"] .rot-icon{ transform: rotate(-90deg); }
+#app[data-rot="180"] .rot-icon{ transform: rotate(180deg); }
+#app[data-rot="270"] .rot-icon{ transform: rotate(90deg); }

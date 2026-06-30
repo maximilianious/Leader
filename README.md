@@ -11,16 +11,21 @@ It's a installable Progressive Web App (PWA), so on iPhone it can be added to th
 
 ## Features
 
-- **Photo and video capture** — switch between Photo and Video with one tap; video records silently (no microphone permission needed) straight off the graded canvas feed
-- Live front/back camera switch, simulated/real flash (torch where supported)
-- **Aspect ratio control** — 4:3 (default), 1:1, or Full, switchable from a quick pill in the header or from Settings; the viewfinder always fills the available screen space for the chosen ratio with no wasted gap
-- 11 total looks across the two modes, each with its own grain, vignette, light leak, split-tone or scanline treatment. **FXN R** — a punchy, cool-cast digicam-flash look — is the default Digital look
-- Looks live in a collapsible drawer (tap the look chip to expand/collapse) instead of always taking up screen space
+- **Photo and video capture** — switch between Photo and Video with one tap; video records sound once the microphone is enabled (see below)
+- **Quality control** — Photo defaults to 4K, Video defaults to 1080p/30fps. Photo quality (4K/1080p/720p) and video resolution (720p/1080p/4K) and frame rate (24/30/60fps) are all independently switchable in Settings, so e.g. 4K·60fps or 720p·24fps both work if the device's camera supports them
+- **Zoom** — quick 0.5×/1×/2×/3× presets below the preview, plus pinch-to-zoom on the viewfinder for anything in between or beyond. 0.5× switches to the phone's ultra-wide lens when one is detected (falls back gracefully with a toast if the device doesn't have one); 1× and up are a fast digital crop applied identically to the live preview, captures, and recordings
+- Live front/back camera switch (sitting in its own row right below the preview), simulated/real flash (torch where supported)
+- **Aspect ratio control** — 4:3 (default), 5:4, 3:2, 1:1, 16:9, or Full, switchable from a quick pill in the header (cycles through all six) or precisely from Settings
+- 11 total looks across the two modes, each with its own grain, vignette, light leak, split-tone or scanline treatment. **FXN R** is the default Digital look
+- **Date stamp toggle** — turn the film-style date burn-in on or off for every look at once, in Settings
+- **Orientation-aware** — rotating the phone to landscape (either side) or upside-down is detected live; the flip, settings, gallery, and flash icons rotate to stay upright the way a native camera app's do, while the control layout itself stays put and every feature keeps working
+- Looks live in a collapsible drawer; mode switches are compact two-up segmented pills, so the controls stay out of the way and the live preview gets most of the screen
 - Film-style frame counter that persists across sessions
-- In-app **"Your Roll"** gallery (IndexedDB) — works fully offline, holds both photos and videos
+- In-app **"Your Roll"** gallery (IndexedDB) — works fully offline, holds both photos and videos, and scrolls as a normal page instead of being boxed into a fixed grid
 - Swipe left/right (or use the on-screen arrows / arrow keys) to move between items in the roll viewer
-- **Save to Photos automatically** — on by default, toggleable in Settings; every capture is immediately offered to your camera roll via the native Share Sheet, with a download fallback
-- The camera permission is only ever requested once per browser/device — the app remembers a successful grant locally and never shows its own "enable camera" prompt again unless access is actually revoked
+- **Saves straight to your camera roll, not the Files app** — on by default, toggleable in Settings. Every capture is offered through the native Share Sheet's "Save Image"/"Save Video" action; if that's unavailable, the app opens the photo/video full-screen so a long-press can save it to Photos directly. There's intentionally no download-link fallback, since that's what sends files to the Files app instead of Photos
+- The camera permission is only ever requested once per browser/device, and the microphone permission is requested exactly once — the first time you tap **Video** — never inside the recording flow itself
+- Tuned to stay cool: the live preview caches its gradient/vignette/light-leak/grain artwork instead of rebuilding it every frame, runs at a capped 30fps, and fully releases the camera whenever the app is backgrounded or a sheet (gallery, viewer, settings) covers the preview
 - Installable PWA with offline app-shell caching via a service worker
 - No backend, no analytics, no external requests, no accounts — 100% client-side, open source
 
