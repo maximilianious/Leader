@@ -11,13 +11,18 @@ It's a installable Progressive Web App (PWA), so on iPhone it can be added to th
 
 ## Features
 
+- **Photo and video capture** — switch between Photo and Video with one tap; video records silently (no microphone permission needed) straight off the graded canvas feed
 - Live front/back camera switch, simulated/real flash (torch where supported)
-- 10 total looks across the two modes, each with its own grain, vignette, light leak, split-tone or scanline treatment
+- **Aspect ratio control** — 4:3 (default), 1:1, or Full, switchable from a quick pill in the header or from Settings; the viewfinder always fills the available screen space for the chosen ratio with no wasted gap
+- 11 total looks across the two modes, each with its own grain, vignette, light leak, split-tone or scanline treatment. **FXN R** — a punchy, cool-cast digicam-flash look — is the default Digital look
+- Looks live in a collapsible drawer (tap the look chip to expand/collapse) instead of always taking up screen space
 - Film-style frame counter that persists across sessions
-- In-app "Your Roll" gallery (IndexedDB) — works fully offline
-- One-tap **Save to Photos** using the native Share Sheet (`navigator.share`) with a download fallback
+- In-app **"Your Roll"** gallery (IndexedDB) — works fully offline, holds both photos and videos
+- Swipe left/right (or use the on-screen arrows / arrow keys) to move between items in the roll viewer
+- **Save to Photos automatically** — on by default, toggleable in Settings; every capture is immediately offered to your camera roll via the native Share Sheet, with a download fallback
+- The camera permission is only ever requested once per browser/device — the app remembers a successful grant locally and never shows its own "enable camera" prompt again unless access is actually revoked
 - Installable PWA with offline app-shell caching via a service worker
-- No backend, no analytics, no external requests — 100% client-side
+- No backend, no analytics, no external requests, no accounts — 100% client-side, open source
 
 ## Run it locally
 
@@ -63,7 +68,7 @@ That's it — every push to `main` will auto-redeploy.
 3. Launch it from the Home Screen icon — it opens full-screen, no browser chrome, just like a native camera app.
 4. Take a photo, then tap **Save to Photos** in the viewer (or tap your last shot's thumbnail → open it → **Save to Photos**). iOS will show its native share sheet — choose **Save Image** to drop it straight into your camera roll.
 
-> iOS restricts what web apps can do compared to a native camera app — this app cannot bypass the Photos permission prompt the very first time you save an image, and it cannot replace the system Camera app as your default. What it *can* do is feel and behave like a dedicated camera app once installed, with on-device processing and a real save-to-roll flow.
+> iOS restricts what web apps can do compared to a native camera app — this app cannot bypass the Photos permission prompt the very first time you save an image, and it cannot replace the system Camera app as your default. What it *can* do is feel and behave like a dedicated camera app once installed, with on-device processing and an automatic save-to-roll flow. Browsers (and iOS specifically) remember a granted camera permission themselves, and this app additionally remembers locally that you've granted it before so it never shows its own permission screen again unless access is actually revoked.
 
 ## Project structure
 

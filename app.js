@@ -1,14 +1,23 @@
 /* ============================================================
    LEADER — a two-personality camera (Digital film / Professional)
    All processing happens on-device. No network calls, no analytics.
+   Settings, the permission flag, and the roll itself never leave
+   this browser/device (localStorage + IndexedDB only).
    ============================================================ */
 
 (() => {
   'use strict';
 
   /* ---------------- Look definitions ---------------- */
+  // FXN R sits first in the Digital array, which makes it the default look.
   const LOOKS = {
     digital: [
+      {
+        id: 'fxnr', name: 'FXN R', short: 'FX',
+        css: 'contrast(1.3) saturate(0.8) brightness(1.07) hue-rotate(-8deg)',
+        grain: 0.22, vignette: 0.34,
+        leak: null, tint: 'rgba(150,195,185,0.07)', stamp: true, flashy: true,
+      },
       {
         id: 'kodacolor', name: 'KODACOLOR 400', short: 'KC',
         css: 'contrast(1.06) saturate(1.18) brightness(1.04) sepia(0.08)',
@@ -72,18 +81,45 @@
     ],
   };
 
+  const ASPECTS = {
+    '4:3': { ratio: 3 / 4, label: '4:3', desc: '4:3 — classic frame' },
+    '1:1': { ratio: 1, label: '1:1', desc: '1:1 — square frame' },
+    full: { ratio: null, label: 'Full', desc: 'Full — fills the screen' },
+  };
+  const ASPECT_ORDER = ['4:3', '1:1', 'full'];
+
+  /* ---------------- Persisted preferences ---------------- */
+  const PREF = {
+    frame: 'leader_frame',
+    aspect: 'leader_aspect',
+    autoSave: 'leader_autosave',
+    cameraGranted: 'leader_camera_granted',
+  };
+
   /* ---------------- State ---------------- */
   const state = {
     mode: 'digital',
+    captureMode: 'photo', // 'photo' | 'video'
     lookIndex: 0,
+    aspect: localStorage.getItem(PREF.aspect) || '4:3',
     facing: 'environment',
     stream: null,
     track: null,
     flash: false,
-    frame: Number(localStorage.getItem('leader_frame') || '0'),
+    autoSave: localStorage.getItem(PREF.autoSave) !== 'false', // default true
+    frame: Number(localStorage.getItem(PREF.frame) || '0'),
     noiseTiles: [],
     noiseIdx: 0,
     rafId: null,
+    recording: false,
+    recorder: null,
+    recChunks: [],
+    recStart: 0,
+    recTimerId: null,
+    rollCache: [],
+    viewerIndex: -1,
+    micTrack: null,
+    micRequested: localStorage.getItem('leader_mic_requested') === 'true',
   };
 
   /* ---------------- DOM ---------------- */
@@ -95,11 +131,20 @@
   const permMsg = $('permMsg');
   const fcNum = $('fcNum');
   const dial = $('dial');
-  const currentLookLabel = $('currentLookLabel');
+  const dialDrawer = $('dialDrawer');
+  const lookToggle = $('lookToggle');
+  const ltChip = $('ltChip');
+  const ltName = $('ltName');
   const lastShot = $('lastShot');
   const lastShotImg = $('lastShotImg');
   const thumbFrame = $('thumbFrame');
   const toastEl = $('toast');
+  const viewfinder = $('viewfinder');
+  const viewfinderWrap = $('viewfinderWrap');
+  const btnAspect = $('btnAspect');
+  const recTimer = $('recTimer');
+  const recTime = $('recTime');
+  const btnShutter = $('btnShutter');
 
   /* ---------------- Toast ---------------- */
   let toastTimer = null;
@@ -107,12 +152,12 @@
     toastEl.textContent = msg;
     toastEl.classList.add('show');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2200);
+    toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2400);
   }
 
-  /* ---------------- IndexedDB photo store ---------------- */
+  /* ---------------- IndexedDB roll store ---------------- */
   const DB_NAME = 'leader-roll';
-  const STORE = 'photos';
+  const STORE = 'photos'; // holds both photos and videos, distinguished by `type`
   let dbPromise = null;
   function getDB() {
     if (dbPromise) return dbPromise;
@@ -120,9 +165,7 @@
       const req = indexedDB.open(DB_NAME, 1);
       req.onupgradeneeded = () => {
         const db = req.result;
-        if (!db.objectStoreNames.contains(STORE)) {
-          db.createObjectStore(STORE, { keyPath: 'id' });
-        }
+        if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, { keyPath: 'id' });
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
@@ -162,7 +205,7 @@
     stopCamera();
     try {
       const constraints = {
-        audio: false,
+        audio: false, // no microphone request — keeps this to a single permission prompt
         video: {
           facingMode: state.facing,
           width: { ideal: 1920 },
@@ -176,7 +219,8 @@
       await video.play();
       permMsg.classList.add('hidden');
       video.classList.toggle('mirror', state.facing === 'user');
-      resizeCanvas();
+      localStorage.setItem(PREF.cameraGranted, 'true');
+      layoutViewfinder();
       runLoop();
     } catch (err) {
       console.warn('Camera error', err);
@@ -195,13 +239,29 @@
     state.stream = null;
     state.track = null;
   }
-  function resizeCanvas() {
-    const rect = canvas.parentElement.getBoundingClientRect();
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    canvas.width = Math.round(rect.width * dpr);
-    canvas.height = Math.round(rect.height * dpr);
+
+  /* ---------------- Viewfinder sizing (fills the screen, no overflow) ---------------- */
+  function layoutViewfinder() {
+    const wrapRect = viewfinderWrap.getBoundingClientRect();
+    const def = ASPECTS[state.aspect];
+    let w, h;
+    if (!def.ratio) {
+      w = wrapRect.width; h = wrapRect.height;
+    } else {
+      w = wrapRect.width; h = w / def.ratio;
+      if (h > wrapRect.height) { h = wrapRect.height; w = h * def.ratio; }
+    }
+    viewfinder.style.width = `${Math.round(w)}px`;
+    viewfinder.style.height = `${Math.round(h)}px`;
+    resizeCanvas();
   }
-  window.addEventListener('resize', resizeCanvas);
+  function resizeCanvas() {
+    const rect = viewfinder.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.max(1, Math.round(rect.width * dpr));
+    canvas.height = Math.max(1, Math.round(rect.height * dpr));
+  }
+  window.addEventListener('resize', layoutViewfinder);
 
   /* ---------------- Noise tiles (pre-baked grain) ---------------- */
   function makeNoiseTile(size = 180) {
@@ -220,8 +280,16 @@
   for (let i = 0; i < 6; i++) state.noiseTiles.push(makeNoiseTile());
 
   /* ---------------- Render pipeline ---------------- */
-  function getLook() {
-    return LOOKS[state.mode][state.lookIndex];
+  function getLook() { return LOOKS[state.mode][state.lookIndex]; }
+
+  function drawCover(targetCtx, vidEl, w, h) {
+    const vw = vidEl.videoWidth, vh = vidEl.videoHeight;
+    if (!vw || !vh) return;
+    const vRatio = vw / vh, cRatio = w / h;
+    let sx, sy, sw, sh;
+    if (vRatio > cRatio) { sh = vh; sw = vh * cRatio; sx = (vw - sw) / 2; sy = 0; }
+    else { sw = vw; sh = vw / cRatio; sx = 0; sy = (vh - sh) / 2; }
+    targetCtx.drawImage(vidEl, sx, sy, sw, sh, 0, 0, w, h);
   }
 
   function drawVignette(c, w, h, amount) {
@@ -229,70 +297,40 @@
     const g = c.createRadialGradient(w / 2, h / 2, h * 0.25, w / 2, h / 2, h * 0.75);
     g.addColorStop(0, 'rgba(0,0,0,0)');
     g.addColorStop(1, `rgba(0,0,0,${amount})`);
-    c.save();
-    c.globalCompositeOperation = 'multiply';
-    c.fillStyle = g;
-    c.fillRect(0, 0, w, h);
-    c.restore();
+    c.save(); c.globalCompositeOperation = 'multiply'; c.fillStyle = g; c.fillRect(0, 0, w, h); c.restore();
   }
-
   function drawLeak(c, w, h, leak) {
     if (!leak) return;
     const positions = { tl: [0, 0], tr: [w, 0], bl: [0, h], br: [w, h] };
     const [x, y] = positions[leak.corner] || [w, 0];
     const g = c.createRadialGradient(x, y, 0, x, y, Math.max(w, h) * 0.6);
-    g.addColorStop(0, leak.color);
-    g.addColorStop(1, 'rgba(0,0,0,0)');
-    c.save();
-    c.globalCompositeOperation = 'screen';
-    c.fillStyle = g;
-    c.fillRect(0, 0, w, h);
-    c.restore();
+    g.addColorStop(0, leak.color); g.addColorStop(1, 'rgba(0,0,0,0)');
+    c.save(); c.globalCompositeOperation = 'screen'; c.fillStyle = g; c.fillRect(0, 0, w, h); c.restore();
   }
-
   function drawSplitTone(c, w, h, st) {
     if (!st) return;
-    c.save();
-    c.globalCompositeOperation = 'overlay';
+    c.save(); c.globalCompositeOperation = 'overlay';
     const g = c.createLinearGradient(0, 0, 0, h);
-    g.addColorStop(0, st.hi);
-    g.addColorStop(1, st.shadow);
-    c.fillStyle = g;
-    c.fillRect(0, 0, w, h);
-    c.restore();
+    g.addColorStop(0, st.hi); g.addColorStop(1, st.shadow);
+    c.fillStyle = g; c.fillRect(0, 0, w, h); c.restore();
   }
-
   function drawTint(c, w, h, tint) {
     if (!tint) return;
-    c.save();
-    c.globalCompositeOperation = 'screen';
-    c.fillStyle = tint;
-    c.fillRect(0, 0, w, h);
-    c.restore();
+    c.save(); c.globalCompositeOperation = 'screen'; c.fillStyle = tint; c.fillRect(0, 0, w, h); c.restore();
   }
-
   function drawGrain(c, w, h, amount, animated) {
     if (amount <= 0) return;
     const tile = state.noiseTiles[state.noiseIdx];
     if (animated) state.noiseIdx = (state.noiseIdx + 1) % state.noiseTiles.length;
     const pattern = c.createPattern(tile, 'repeat');
-    c.save();
-    c.globalCompositeOperation = 'overlay';
-    c.globalAlpha = Math.min(amount, 0.6);
-    c.fillStyle = pattern;
-    c.fillRect(0, 0, w, h);
-    c.restore();
+    c.save(); c.globalCompositeOperation = 'overlay'; c.globalAlpha = Math.min(amount, 0.6);
+    c.fillStyle = pattern; c.fillRect(0, 0, w, h); c.restore();
   }
-
   function drawScanlines(c, w, h) {
-    c.save();
-    c.globalCompositeOperation = 'multiply';
-    c.globalAlpha = 0.5;
-    c.fillStyle = '#000';
+    c.save(); c.globalCompositeOperation = 'multiply'; c.globalAlpha = 0.5; c.fillStyle = '#000';
     for (let y = 0; y < h; y += 3) c.fillRect(0, y, w, 1);
     c.restore();
   }
-
   function drawStamp(c, w, h, look) {
     if (!look.stamp) return;
     const now = new Date();
@@ -300,14 +338,10 @@
     const size = Math.max(14, w * 0.026);
     c.save();
     c.font = `${size}px "JetBrains Mono", monospace`;
-    c.textAlign = 'right';
-    c.textBaseline = 'bottom';
-    const px = w - w * 0.035;
-    const py = h - h * 0.03;
-    c.fillStyle = 'rgba(0,0,0,0.35)';
-    c.fillText(txt, px + size * 0.06, py + size * 0.06);
-    c.fillStyle = '#ff8a1f';
-    c.fillText(txt, px, py);
+    c.textAlign = 'right'; c.textBaseline = 'bottom';
+    const px = w - w * 0.035, py = h - h * 0.03;
+    c.fillStyle = 'rgba(0,0,0,0.35)'; c.fillText(txt, px + size * 0.06, py + size * 0.06);
+    c.fillStyle = '#ff8a1f'; c.fillText(txt, px, py);
     c.restore();
   }
 
@@ -316,7 +350,7 @@
     targetCtx.save();
     if (mirror) { targetCtx.translate(w, 0); targetCtx.scale(-1, 1); }
     targetCtx.filter = look.css;
-    targetCtx.drawImage(video, 0, 0, w, h);
+    drawCover(targetCtx, video, w, h);
     targetCtx.restore();
     targetCtx.filter = 'none';
 
@@ -331,15 +365,31 @@
   function runLoop() {
     function frame() {
       if (video.readyState >= 2 && canvas.width && canvas.height) {
-        render(ctx, canvas.width, canvas.height, getLook(), {
-          animatedGrain: true,
-          mirror: state.facing === 'user',
-        });
+        render(ctx, canvas.width, canvas.height, getLook(), { animatedGrain: true, mirror: state.facing === 'user' });
       }
       state.rafId = requestAnimationFrame(frame);
     }
     state.rafId = requestAnimationFrame(frame);
   }
+
+  /* ---------------- Aspect ratio control ---------------- */
+  function setAspect(key) {
+    state.aspect = key;
+    localStorage.setItem(PREF.aspect, key);
+    btnAspect.textContent = ASPECTS[key].label;
+    viewfinder.dataset.aspect = key;
+    document.getElementById('aspectSettingDesc').textContent = ASPECTS[key].desc;
+    document.querySelectorAll('#aspectSettingSwitch .seg-btn').forEach((b) =>
+      b.classList.toggle('active', b.dataset.aspect === key));
+    layoutViewfinder();
+  }
+  btnAspect.addEventListener('click', () => {
+    const idx = ASPECT_ORDER.indexOf(state.aspect);
+    setAspect(ASPECT_ORDER[(idx + 1) % ASPECT_ORDER.length]);
+  });
+  document.querySelectorAll('#aspectSettingSwitch .seg-btn').forEach((b) => {
+    b.addEventListener('click', () => setAspect(b.dataset.aspect));
+  });
 
   /* ---------------- Dial / mode UI ---------------- */
   function buildDial() {
@@ -367,15 +417,33 @@
     if (active) active.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
   }
   function updateLookLabel() {
-    currentLookLabel.textContent = getLook().name;
+    const look = getLook();
+    ltChip.textContent = look.short;
+    ltName.textContent = look.name;
+    document.getElementById('lookInfo').textContent = lookDescription(look);
+  }
+  function lookDescription(look) {
+    const bits = [];
+    if (look.grain) bits.push('grain');
+    if (look.vignette) bits.push('vignette');
+    if (look.leak) bits.push('light leak');
+    if (look.scanlines) bits.push('scanlines');
+    if (look.splitTone) bits.push('split-tone grade');
+    if (look.sharpen) bits.push('clarity boost');
+    return `${look.name} — ${bits.join(', ') || 'clean & neutral'}`;
   }
 
   $('dialLeft').addEventListener('click', () => selectLook(state.lookIndex - 1));
   $('dialRight').addEventListener('click', () => selectLook(state.lookIndex + 1));
 
-  document.querySelectorAll('.mode-btn').forEach((btn) => {
+  lookToggle.addEventListener('click', () => {
+    const open = dialDrawer.classList.toggle('open');
+    lookToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+
+  document.querySelectorAll('#gradeModeSwitch .seg-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
-      document.querySelectorAll('.mode-btn').forEach((b) => {
+      document.querySelectorAll('#gradeModeSwitch .seg-btn').forEach((b) => {
         b.classList.toggle('active', b === btn);
         b.setAttribute('aria-selected', b === btn ? 'true' : 'false');
       });
@@ -385,8 +453,36 @@
     });
   });
 
+  /* ---------------- Microphone (requested once, only for video) ---------------- */
+  async function ensureMic() {
+    if (state.micTrack || state.micRequested) return;
+    state.micRequested = true;
+    localStorage.setItem('leader_mic_requested', 'true');
+    try {
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      state.micTrack = micStream.getAudioTracks()[0];
+      toast('Microphone enabled — videos will record sound');
+    } catch (err) {
+      toast('Recording without sound — microphone access wasn\u2019t granted');
+    }
+  }
+
+  document.querySelectorAll('#captureModeSwitch .seg-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      if (state.recording) { toast('Stop recording first'); return; }
+      document.querySelectorAll('#captureModeSwitch .seg-btn').forEach((b) => {
+        b.classList.toggle('active', b === btn);
+        b.setAttribute('aria-selected', b === btn ? 'true' : 'false');
+      });
+      state.captureMode = btn.dataset.capture;
+      btnShutter.setAttribute('aria-label', state.captureMode === 'video' ? 'Record video' : 'Take photo');
+      if (state.captureMode === 'video') ensureMic();
+    });
+  });
+
   /* ---------------- Flip / flash ---------------- */
   $('btnFlip').addEventListener('click', () => {
+    if (state.recording) { toast('Stop recording first'); return; }
     state.facing = state.facing === 'user' ? 'environment' : 'user';
     startCamera();
   });
@@ -399,13 +495,36 @@
       try { await state.track.applyConstraints({ advanced: [{ torch: state.flash }] }); }
       catch (e) { /* torch not actually supported, ignore */ }
     } else if (state.flash) {
-      toast('This device has no torch — flash will simulate a pop on capture');
+      toast('No hardware torch — flash will simulate a pop on capture');
     }
   });
 
   $('btnGrant').addEventListener('click', startCamera);
 
-  /* ---------------- Capture ---------------- */
+  /* ---------------- Settings sheet ---------------- */
+  const settingsSheet = $('settingsSheet');
+  const settingsBackdrop = $('settingsBackdrop');
+  function openSettings() {
+    settingsSheet.classList.remove('hidden');
+    settingsBackdrop.classList.remove('hidden');
+  }
+  function closeSettings() {
+    settingsSheet.classList.add('hidden');
+    settingsBackdrop.classList.add('hidden');
+  }
+  $('btnSettings').addEventListener('click', openSettings);
+  $('btnCloseSettings').addEventListener('click', closeSettings);
+  settingsBackdrop.addEventListener('click', closeSettings);
+
+  const toggleAutoSave = $('toggleAutoSave');
+  toggleAutoSave.checked = state.autoSave;
+  toggleAutoSave.addEventListener('change', () => {
+    state.autoSave = toggleAutoSave.checked;
+    localStorage.setItem(PREF.autoSave, String(state.autoSave));
+    toast(state.autoSave ? 'Auto-save to Photos turned on' : 'Auto-save to Photos turned off');
+  });
+
+  /* ---------------- Capture: photo ---------------- */
   function fireFlashPop() {
     const el = document.getElementById('flashPop');
     el.classList.remove('fire');
@@ -413,34 +532,40 @@
     el.classList.add('fire');
   }
 
+  function bumpFrameCounter() {
+    state.frame += 1;
+    localStorage.setItem(PREF.frame, String(state.frame));
+    fcNum.textContent = String(state.frame).padStart(3, '0');
+  }
+
   async function takePhoto() {
     if (!video.videoWidth) { toast('Camera still warming up…'); return; }
-    $('btnShutter').classList.add('flashing');
+    btnShutter.classList.add('flashing');
     fireFlashPop();
     if (navigator.vibrate) navigator.vibrate(12);
 
     const look = getLook();
-    const w = video.videoWidth;
-    const h = video.videoHeight;
-    captureCanvas.width = w;
-    captureCanvas.height = h;
+    const def = ASPECTS[state.aspect];
+    const vw = video.videoWidth, vh = video.videoHeight;
+    let tw, th;
+    if (!def.ratio) { tw = vw; th = vh; }
+    else if (vw / vh > def.ratio) { th = vh; tw = Math.round(vh * def.ratio); }
+    else { tw = vw; th = Math.round(vw / def.ratio); }
+
+    captureCanvas.width = tw;
+    captureCanvas.height = th;
     const cctx = captureCanvas.getContext('2d');
-    render(cctx, w, h, look, { animatedGrain: false, mirror: state.facing === 'user' });
-    drawStamp(cctx, w, h, look);
+    render(cctx, tw, th, look, { animatedGrain: false, mirror: state.facing === 'user' });
+    drawStamp(cctx, tw, th, look);
 
     const blob = await new Promise((resolve) => captureCanvas.toBlob(resolve, 'image/jpeg', 0.92));
     const dataUrl = captureCanvas.toDataURL('image/jpeg', 0.92);
 
-    state.frame += 1;
-    localStorage.setItem('leader_frame', String(state.frame));
-    fcNum.textContent = String(state.frame).padStart(3, '0');
+    bumpFrameCounter();
 
     const record = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      ts: Date.now(),
-      mode: state.mode,
-      lookName: look.name,
-      blob,
+      ts: Date.now(), type: 'photo', mode: state.mode, lookName: look.name, blob,
     };
     await dbAdd(record);
 
@@ -448,35 +573,114 @@
     lastShot.classList.add('show');
     thumbFrame.innerHTML = `<img src="${dataUrl}" alt="Last photo" />`;
 
-    setTimeout(() => $('btnShutter').classList.remove('flashing'), 220);
+    setTimeout(() => btnShutter.classList.remove('flashing'), 220);
     toast(`Captured — ${look.name}`);
     refreshGalleryIfOpen();
+
+    if (state.autoSave) savePhotoBlob(blob, `leader-${record.id}.jpg`, 'image/jpeg');
   }
 
-  $('btnShutter').addEventListener('click', takePhoto);
+  /* ---------------- Capture: video ---------------- */
+  function pickRecorderMime() {
+    const candidates = ['video/mp4', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+    for (const m of candidates) {
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) return m;
+    }
+    return '';
+  }
+
+  function startRecTimer() {
+    state.recStart = Date.now();
+    recTimer.classList.remove('hidden');
+    state.recTimerId = setInterval(() => {
+      const s = Math.floor((Date.now() - state.recStart) / 1000);
+      const mm = Math.floor(s / 60), ss = s % 60;
+      recTime.textContent = `${mm}:${String(ss).padStart(2, '0')}`;
+    }, 250);
+  }
+  function stopRecTimer() {
+    clearInterval(state.recTimerId);
+    recTimer.classList.add('hidden');
+    recTime.textContent = '0:00';
+  }
+
+  async function startRecording() {
+    if (!canvas.captureStream) { toast('Video recording isn\u2019t supported in this browser'); return; }
+    const mime = pickRecorderMime();
+    const fps = 30;
+    const camStream = canvas.captureStream(fps);
+    const tracks = [...camStream.getVideoTracks()];
+    if (state.micTrack && state.micTrack.readyState === 'live') tracks.push(state.micTrack);
+    const combined = new MediaStream(tracks);
+    try {
+      state.recorder = mime ? new MediaRecorder(combined, { mimeType: mime }) : new MediaRecorder(combined);
+    } catch (e) {
+      toast('Could not start the recorder on this browser'); return;
+    }
+    state.recChunks = [];
+    state.recorder.ondataavailable = (e) => { if (e.data && e.data.size) state.recChunks.push(e.data); };
+    state.recorder.onstop = onRecordingStop;
+    state.recorder.start(250);
+    state.recording = true;
+    btnShutter.classList.add('recording');
+    startRecTimer();
+    if (navigator.vibrate) navigator.vibrate(15);
+  }
+
+  function stopRecording() {
+    if (state.recorder && state.recording) state.recorder.stop();
+  }
+
+  async function onRecordingStop() {
+    state.recording = false;
+    btnShutter.classList.remove('recording');
+    stopRecTimer();
+    const type = state.recorder.mimeType || 'video/webm';
+    const blob = new Blob(state.recChunks, { type });
+    state.recChunks = [];
+
+    bumpFrameCounter();
+    const look = getLook();
+    const record = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      ts: Date.now(), type: 'video', mode: state.mode, lookName: look.name, blob, mime: type,
+    };
+    await dbAdd(record);
+    toast(`Saved video — ${look.name}`);
+    refreshGalleryIfOpen();
+
+    const ext = type.includes('mp4') ? 'mp4' : 'webm';
+    if (state.autoSave) savePhotoBlob(blob, `leader-${record.id}.${ext}`, type);
+  }
+
+  function handleShutter() {
+    if (state.captureMode === 'video') {
+      if (state.recording) stopRecording(); else startRecording();
+    } else {
+      takePhoto();
+    }
+  }
+  btnShutter.addEventListener('click', handleShutter);
   lastShot.addEventListener('click', () => openGallery());
 
   /* ---------------- Saving to Photos ---------------- */
-  async function savePhotoBlob(blob, filename) {
-    const file = new File([blob], filename, { type: 'image/jpeg' });
-    if (navigator.canShare && navigator.canShare({ files: [file] })) {
-      try {
+  async function savePhotoBlob(blob, filename, mime) {
+    try {
+      const file = new File([blob], filename, { type: mime });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
         await navigator.share({ files: [file] });
-        toast('Choose "Save Image" to add it to your camera roll');
+        toast('Choose "Save" to add it to your camera roll');
         return;
-      } catch (err) {
-        if (err && err.name === 'AbortError') return; // user cancelled
       }
+    } catch (err) {
+      if (err && err.name === 'AbortError') return; // user cancelled the share sheet
     }
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
-    toast('Saved — check Downloads, or long-press the image to add to Photos');
+    toast('Saved — check Downloads, or long-press to add to Photos');
   }
 
   /* ---------------- Gallery ---------------- */
@@ -484,27 +688,29 @@
   const galleryGrid = $('galleryGrid');
   const galleryEmpty = $('galleryEmpty');
   let galleryOpen = false;
+  const PLAY_ICON = '<span class="g-play"><svg viewBox="0 0 24 24" fill="white"><circle cx="12" cy="12" r="11" fill="rgba(0,0,0,.4)"/><path d="M10 8l7 4-7 4V8z" fill="white"/></svg></span>';
 
   async function openGallery() {
     galleryOpen = true;
     gallery.classList.remove('hidden');
     await refreshGallery();
   }
-  function closeGallery() {
-    galleryOpen = false;
-    gallery.classList.add('hidden');
-  }
+  function closeGallery() { galleryOpen = false; gallery.classList.add('hidden'); }
   function refreshGalleryIfOpen() { if (galleryOpen) refreshGallery(); }
 
   async function refreshGallery() {
     const items = await dbAll();
+    state.rollCache = items;
     galleryGrid.innerHTML = '';
     galleryEmpty.classList.toggle('hidden', items.length > 0);
-    items.forEach((item) => {
+    items.forEach((item, idx) => {
       const url = URL.createObjectURL(item.blob);
       const btn = document.createElement('button');
-      btn.innerHTML = `<img src="${url}" alt="${item.lookName}"><span class="g-mode">${item.mode === 'pro' ? 'PRO' : 'DIG'}</span>`;
-      btn.addEventListener('click', () => openViewer(item, url));
+      const mediaTag = item.type === 'video'
+        ? `<video src="${url}" muted playsinline></video>${PLAY_ICON}`
+        : `<img src="${url}" alt="${item.lookName}">`;
+      btn.innerHTML = `${mediaTag}<span class="g-mode">${item.mode === 'pro' ? 'PRO' : 'DIG'}${item.type === 'video' ? ' · VID' : ''}</span>`;
+      btn.addEventListener('click', () => openViewer(idx));
       galleryGrid.appendChild(btn);
     });
   }
@@ -512,56 +718,107 @@
   $('btnGallery').addEventListener('click', openGallery);
   $('btnCloseGallery').addEventListener('click', closeGallery);
 
-  /* ---------------- Viewer ---------------- */
+  /* ---------------- Viewer (with swipe + arrow navigation) ---------------- */
   const viewer = $('viewer');
   const viewerImg = $('viewerImg');
+  const viewerVideo = $('viewerVideo');
   const viewerTag = $('viewerTag');
-  let viewerItem = null;
+  const viewerStage = $('viewerStage');
+  const btnViewerPrev = $('btnViewerPrev');
+  const btnViewerNext = $('btnViewerNext');
 
-  function openViewer(item, url) {
-    viewerItem = item;
-    viewerImg.src = url;
-    const d = new Date(item.ts);
-    viewerTag.textContent = `${item.lookName} · ${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+  function currentViewerItem() { return state.rollCache[state.viewerIndex]; }
+
+  function openViewer(index) {
+    state.viewerIndex = index;
+    renderViewer();
     viewer.classList.remove('hidden');
   }
   function closeViewer() {
     viewer.classList.add('hidden');
-    viewerItem = null;
+    viewerVideo.pause();
+    state.viewerIndex = -1;
+  }
+  function renderViewer() {
+    const item = currentViewerItem();
+    if (!item) { closeViewer(); return; }
+    const url = URL.createObjectURL(item.blob);
+    if (item.type === 'video') {
+      viewerVideo.src = url;
+      viewerVideo.classList.remove('hidden');
+      viewerImg.classList.add('hidden');
+    } else {
+      viewerImg.src = url;
+      viewerImg.classList.remove('hidden');
+      viewerVideo.classList.add('hidden');
+      viewerVideo.pause();
+    }
+    const d = new Date(item.ts);
+    viewerTag.textContent = `${item.lookName} · ${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+    btnViewerPrev.disabled = state.viewerIndex <= 0;
+    btnViewerNext.disabled = state.viewerIndex >= state.rollCache.length - 1;
+  }
+  function viewerStep(delta) {
+    const next = state.viewerIndex + delta;
+    if (next < 0 || next >= state.rollCache.length) return;
+    state.viewerIndex = next;
+    renderViewer();
   }
   $('btnCloseViewer').addEventListener('click', closeViewer);
+  btnViewerPrev.addEventListener('click', () => viewerStep(-1));
+  btnViewerNext.addEventListener('click', () => viewerStep(1));
+
+  // Touch swipe across the stage
+  let touchStartX = null, touchStartY = null;
+  viewerStage.addEventListener('touchstart', (e) => {
+    touchStartX = e.touches[0].clientX;
+    touchStartY = e.touches[0].clientY;
+  }, { passive: true });
+  viewerStage.addEventListener('touchend', (e) => {
+    if (touchStartX === null) return;
+    const dx = e.changedTouches[0].clientX - touchStartX;
+    const dy = e.changedTouches[0].clientY - touchStartY;
+    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+      viewerStep(dx > 0 ? -1 : 1);
+    }
+    touchStartX = null; touchStartY = null;
+  }, { passive: true });
+
+  // Keyboard navigation when the viewer is open
+  document.addEventListener('keydown', (e) => {
+    if (viewer.classList.contains('hidden')) return;
+    if (e.key === 'ArrowLeft') viewerStep(-1);
+    if (e.key === 'ArrowRight') viewerStep(1);
+    if (e.key === 'Escape') closeViewer();
+  });
 
   $('btnSave').addEventListener('click', () => {
-    if (!viewerItem) return;
-    savePhotoBlob(viewerItem.blob, `leader-${viewerItem.id}.jpg`);
+    const item = currentViewerItem();
+    if (!item) return;
+    const ext = item.type === 'video' ? (item.mime && item.mime.includes('mp4') ? 'mp4' : 'webm') : 'jpg';
+    const mime = item.type === 'video' ? (item.mime || 'video/webm') : 'image/jpeg';
+    savePhotoBlob(item.blob, `leader-${item.id}.${ext}`, mime);
   });
   $('btnDelete').addEventListener('click', async () => {
-    if (!viewerItem) return;
-    await dbDelete(viewerItem.id);
-    closeViewer();
-    refreshGallery();
-  });
-
-  /* ---------------- Info ---------------- */
-  $('btnInfo').addEventListener('click', () => {
-    const look = getLook();
-    const bits = [];
-    if (look.grain) bits.push('grain');
-    if (look.vignette) bits.push('vignette');
-    if (look.leak) bits.push('light leak');
-    if (look.scanlines) bits.push('scanlines');
-    if (look.splitTone) bits.push('split-tone grade');
-    if (look.sharpen) bits.push('clarity boost');
-    toast(`${look.name}: ${bits.join(', ') || 'clean & neutral'}`);
+    const item = currentViewerItem();
+    if (!item) return;
+    await dbDelete(item.id);
+    const wasLast = state.viewerIndex === state.rollCache.length - 1;
+    await refreshGallery();
+    if (!state.rollCache.length) { closeViewer(); return; }
+    state.viewerIndex = wasLast ? state.rollCache.length - 1 : Math.min(state.viewerIndex, state.rollCache.length - 1);
+    renderViewer();
   });
 
   /* ---------------- Init ---------------- */
   fcNum.textContent = String(state.frame).padStart(3, '0');
+  setAspect(state.aspect);
   buildDial();
   startCamera();
 
   window.addEventListener('beforeunload', () => {
-    localStorage.setItem('leader_frame', String(state.frame));
+    localStorage.setItem(PREF.frame, String(state.frame));
+    if (state.micTrack) state.micTrack.stop();
   });
 
   if ('serviceWorker' in navigator) {
