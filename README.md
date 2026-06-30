@@ -14,7 +14,7 @@ It's a installable Progressive Web App (PWA), so on iPhone it can be added to th
 - **Photo and video capture** — switch between Photo and Video with one tap; video records sound once the microphone is enabled (see below)
 - **Quality control** — Photo defaults to 4K, Video defaults to 1080p/30fps. Photo quality (4K/1080p/720p) and video resolution (720p/1080p/4K) and frame rate (24/30/60fps) are all independently switchable in Settings, so e.g. 4K·60fps or 720p·24fps both work if the device's camera supports them
 - **Zoom** — quick 0.5×/1×/2×/3× presets below the preview, plus pinch-to-zoom on the viewfinder for anything in between or beyond. 0.5× switches to the phone's ultra-wide lens when one is detected (falls back gracefully with a toast if the device doesn't have one); 1× and up are a fast digital crop applied identically to the live preview, captures, and recordings
-- Live front/back camera switch (sitting in its own row right below the preview), simulated/real flash (torch where supported)
+- Live front/back camera switch (sitting in its own row right below the preview); flash cycles Auto → On → Off like a native camera — it only pulses the torch (where supported) for an instant around the actual capture, or stays lit for the duration of a video clip, never left running in the background
 - **Aspect ratio control** — 4:3 (default), 5:4, 3:2, 1:1, 16:9, or Full, switchable from a quick pill in the header (cycles through all six) or precisely from Settings
 - 11 total looks across the two modes, each with its own grain, vignette, light leak, split-tone or scanline treatment. **FXN R** is the default Digital look
 - **Date stamp toggle** — turn the film-style date burn-in on or off for every look at once, in Settings

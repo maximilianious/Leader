@@ -130,7 +130,7 @@
     facing: 'environment',
     stream: null,
     track: null,
-    flash: false,
+    flashMode: 'auto', // 'auto' | 'on' | 'off' — cycled like a native camera's flash button
     autoSave: localStorage.getItem(PREF.autoSave) !== 'false', // default true
     stampEnabled: localStorage.getItem(PREF.stamp) !== 'false', // default true
     frame: Number(localStorage.getItem(PREF.frame) || '0'),
@@ -150,6 +150,7 @@
     micTrack: null,
     micRequested: localStorage.getItem('leader_mic_requested') === 'true',
     shutterReady: false,    // guards against a stray click bleeding through the native permission sheet
+    firstStartDone: false,
     renderPaused: false,    // true while gallery/viewer/settings cover the camera
     lastFrameTime: 0,
     zoom: 1,                // digital zoom multiplier applied on top of whichever lens is active
@@ -248,6 +249,7 @@
   }
 
   async function startCamera() {
+    if (state.recording) return; // never tear down the stream a recording is actively using
     stopCamera();
     state.shutterReady = false;
     try {
@@ -274,10 +276,15 @@
       runLoop();
       syncZoomCapabilities();
       if (!state.devicesScanned) { state.devicesScanned = true; refreshDeviceList(); }
-      // Ignore the shutter briefly: WebKit can deliver a stray synthetic click at the
-      // same screen coordinates right after the native camera-permission sheet is
-      // dismissed, which otherwise looks like the user tapped the shutter/record button.
-      setTimeout(() => { state.shutterReady = true; }, 700);
+      // Ignore the shutter very briefly only on the app's first-ever camera start:
+      // WebKit can deliver a stray synthetic click at the same screen coordinates
+      // right after the native camera-permission sheet is dismissed, which otherwise
+      // looks like the user tapped the shutter/record button. Later restarts (a
+      // quality/aspect change, flipping cameras) aren't preceded by that system
+      // sheet, so they only need a tiny debounce, not the full cooldown.
+      const cooldown = state.firstStartDone ? 150 : 700;
+      state.firstStartDone = true;
+      setTimeout(() => { state.shutterReady = true; }, cooldown);
     } catch (err) {
       console.warn('Camera error', err);
       // If an explicit lens (ultra-wide/tele) failed, fall back to the default lens
@@ -304,14 +311,15 @@
     state.track = null;
   }
 
-  // Release the camera while the tab/app is backgrounded, and while the gallery,
-  // viewer, or settings sheet are covering the live preview — this is the single
-  // biggest win for heat and battery, since a hidden camera+render loop still
-  // burns CPU/GPU otherwise.
+  // Release the camera while the tab/app is genuinely backgrounded, and re-acquire
+  // it when it comes back — but never while a recording is in progress, and never
+  // redundantly: calling getUserMedia again while a stream is already live was
+  // causing both the stuck "can't stop recording" bug (the live stream got torn
+  // out from under the recorder) and repeated permission prompts on some devices.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
-      stopCamera();
-    } else if (!state.recording) {
+      if (!state.recording) stopCamera();
+    } else if (!state.recording && !state.stream) {
       startCamera();
     }
   });
@@ -815,17 +823,38 @@
     startCamera();
   });
 
-  $('btnFlash').addEventListener('click', async () => {
-    state.flash = !state.flash;
+  /* ---------------- Flash: Auto / On / Off, like a native camera ---------------- */
+  // The flash button only ever picks a *mode* — it never turns the torch on by
+  // itself. The torch is pulsed for ~120ms right around the moment a photo is
+  // actually captured (or held on for the duration of a video clip), never left
+  // running in the background.
+  const FLASH_CYCLE = ['auto', 'on', 'off'];
+  const FLASH_LABEL = { auto: 'Flash: Auto', on: 'Flash: On', off: 'Flash: Off' };
+  function setFlashMode(mode) {
+    state.flashMode = mode;
     const btn = $('btnFlash');
-    btn.dataset.state = state.flash ? 'on' : 'off';
-    if (state.track && state.track.getCapabilities && state.track.getCapabilities().torch) {
-      try { await state.track.applyConstraints({ advanced: [{ torch: state.flash }] }); }
-      catch (e) { /* torch not actually supported, ignore */ }
-    } else if (state.flash) {
-      toast('No hardware torch — flash will simulate a pop on capture');
-    }
+    btn.dataset.state = mode;
+    btn.setAttribute('aria-label', FLASH_LABEL[mode]);
+  }
+  $('btnFlash').addEventListener('click', () => {
+    const next = FLASH_CYCLE[(FLASH_CYCLE.indexOf(state.flashMode) + 1) % FLASH_CYCLE.length];
+    setFlashMode(next);
+    toast(FLASH_LABEL[next]);
   });
+  function hasTorch() {
+    return !!(state.track && state.track.getCapabilities && state.track.getCapabilities().torch);
+  }
+  async function setTorch(on) {
+    if (!hasTorch()) return false;
+    try { await state.track.applyConstraints({ advanced: [{ torch: on }] }); return true; }
+    catch (e) { return false; }
+  }
+  // Video: a flash mode of on/auto means continuous light for the clip's duration —
+  // there's no per-frame "flash" for video, just a torch on while recording.
+  async function setVideoTorch(on) {
+    if (state.flashMode === 'off') return;
+    await setTorch(on);
+  }
 
   $('btnGrant').addEventListener('click', startCamera);
 
@@ -879,8 +908,15 @@
   async function takePhoto() {
     if (!video.videoWidth) { toast('Camera still warming up…'); return; }
     btnShutter.classList.add('flashing');
-    fireFlashPop();
     if (navigator.vibrate) navigator.vibrate(12);
+
+    const willFlash = state.flashMode !== 'off';
+    let torchPulsed = false;
+    if (willFlash) {
+      fireFlashPop();
+      torchPulsed = await setTorch(true);
+      if (torchPulsed) await new Promise((r) => setTimeout(r, 120)); // let the torch actually light the scene before grabbing the frame
+    }
 
     const look = getLook();
     const def = ASPECTS[state.aspect];
@@ -895,6 +931,8 @@
     const cctx = captureCanvas.getContext('2d');
     render(cctx, tw, th, look, { animatedGrain: false, mirror: state.facing === 'user' });
     drawStamp(cctx, tw, th, look);
+
+    if (torchPulsed) setTorch(false); // don't await — no need to hold up saving the photo
 
     const blob = await new Promise((resolve) => captureCanvas.toBlob(resolve, 'image/jpeg', 0.92));
     const dataUrl = captureCanvas.toDataURL('image/jpeg', 0.92);
@@ -948,32 +986,49 @@
     const tracks = [...camStream.getVideoTracks()];
     if (state.micTrack && state.micTrack.readyState === 'live') tracks.push(state.micTrack);
     const combined = new MediaStream(tracks);
+    let recorder;
     try {
-      state.recorder = mime ? new MediaRecorder(combined, { mimeType: mime }) : new MediaRecorder(combined);
+      recorder = mime ? new MediaRecorder(combined, { mimeType: mime }) : new MediaRecorder(combined);
     } catch (e) {
       toast('Could not start the recorder on this browser'); return;
     }
+    state.recorder = recorder;
     state.recChunks = [];
-    state.recorder.ondataavailable = (e) => { if (e.data && e.data.size) state.recChunks.push(e.data); };
-    state.recorder.onstop = onRecordingStop;
-    state.recorder.start(250);
+    recorder.ondataavailable = (e) => { if (e.data && e.data.size) state.recChunks.push(e.data); };
+    recorder.onstop = onRecordingStop;
+    recorder.onerror = () => { toast('Recording stopped unexpectedly'); onRecordingStop(); };
+    recorder.start(250);
     state.recording = true;
     btnShutter.classList.add('recording');
     startRecTimer();
     if (navigator.vibrate) navigator.vibrate(15);
+    setVideoTorch(true); // continuous light for the duration of the clip, like a real camera's video flash
   }
 
   function stopRecording() {
-    if (state.recorder && state.recording) state.recorder.stop();
+    if (!state.recorder) return;
+    if (state.recorder.state !== 'inactive') {
+      state.recorder.stop();
+    } else {
+      // Recorder already died on its own (e.g. a track ended) — clean up directly
+      // instead of leaving the shutter stuck in its "recording" look.
+      onRecordingStop();
+    }
   }
 
   async function onRecordingStop() {
+    if (!state.recording && !state.recorder) return; // avoid double-cleanup if onstop/onerror both fire
     state.recording = false;
     btnShutter.classList.remove('recording');
     stopRecTimer();
-    const type = state.recorder.mimeType || 'video/webm';
+    setVideoTorch(false);
+    const recorder = state.recorder;
+    state.recorder = null;
+    const type = (recorder && recorder.mimeType) || 'video/webm';
     const blob = new Blob(state.recChunks, { type });
     state.recChunks = [];
+
+    if (blob.size === 0) { toast('Recording was too short to save'); return; }
 
     bumpFrameCounter();
     const look = getLook();
@@ -1164,7 +1219,9 @@
   fcNum.textContent = String(state.frame).padStart(3, '0');
   setAspect(state.aspect);
   setPhotoQuality(state.photoQuality, false);
-  setVideoQuality(state.videoQuality, false);
+  setVideoResolution(state.videoResolution, false);
+  setVideoFps(state.videoFps, false);
+  setFlashMode(state.flashMode);
   buildDial();
   startCamera();
 

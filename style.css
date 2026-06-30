@@ -209,6 +209,11 @@ img{display:block; max-width:100%;}
 }
 .deck-side svg{ width:20px; height:20px; }
 .deck-side[data-state="on"]{ color:var(--amber); border-color:var(--amber-dim); }
+.deck-side[data-state="auto"]{ color:var(--bone); border-color:var(--line); position:relative; }
+.deck-side[data-state="auto"]::after{
+  content:"A"; position:absolute; top:3px; right:5px; font-family:var(--mono); font-size:8px;
+  font-weight:700; color:var(--amber); line-height:1;
+}
 .thumb-frame{ width:100%; height:100%; border-radius:9px; overflow:hidden; display:flex; align-items:center; justify-content:center; }
 .thumb-frame img{ width:100%; height:100%; object-fit:cover; }
 
