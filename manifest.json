@@ -1,0 +1,16 @@
+{
+  "name": "LEADER — Film & Pro Camera",
+  "short_name": "Leader",
+  "description": "A two-personality camera: grainy digital-film looks and clean professional grades, with photos saved straight to your camera roll.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#15140f",
+  "theme_color": "#15140f",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
